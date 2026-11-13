@@ -1,5 +1,7 @@
 # pibridge
 
+<img src="docs/icon.png" width="96" alt="PiBridge icon">
+
 > **Superseded by [PiBridge 2](https://github.com/snakepup2000-hue/pibridge2).** This
 > is the original: it works, it is installed as `PiBridge.app`, and it stays as the
 > fallback if PiBridge 2 misbehaves. Both can be installed at once
