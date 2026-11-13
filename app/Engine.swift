@@ -42,6 +42,18 @@ final class Engine: ObservableObject {
         case idle, connecting, playing, stopping, failed
     }
 
+    /// Tags for the track on screen. Read once per selection via Spotlight
+    /// (mdls), which has them for anything CoreAudio can open and costs ~20 ms.
+    struct NowPlaying: Equatable {
+        var title: String = ""
+        var artist: String = ""
+        var album: String = ""
+        var duration: Double = 0
+        var bitrate: Int = 0
+
+        var isEmpty: Bool { title.isEmpty && artist.isEmpty }
+    }
+
     struct Track: Identifiable, Equatable {
         let id: Int
         let path: String
@@ -49,8 +61,8 @@ final class Engine: ObservableObject {
     }
 
     struct Status {
-        var fillMs: Double = 0
-        var bufferMs: Double = 0
+        var fillMs: Double = 0          // one aliased /proc sample; not for display
+        var bufferMs: Double = 0        // the device buffer, as the receiver reports it
         var trimPpm: Double = 0
         var underruns: Int = 0
         var xruns: Int = 0
@@ -58,12 +70,33 @@ final class Engine: ObservableObject {
         var peakDb: Double = -120
         var rmsDb: Double = -120
         var seconds: Double = 0
+
+        // From the receiver's own windowed DELAY stats (@fill). Min is the one
+        // that matters: it is the true worst-case margin, which a single
+        // sampled value cannot show.
+        var devP05Ms: Double = 0
+        var devP50Ms: Double = 0
+        var devP95Ms: Double = 0
+        var devMinMs: Double = 0
+        var devMeanMs: Double = 0
+        var devMaxMs: Double = 0
+        var ringMs: Double = 0
+        var devXruns: Int = 0
+        var hasDeviceStats: Bool = false
+
+        var inFlightMs: Double { devMeanMs > 0 ? devMeanMs + ringMs : 0 }
+
+        var formatLabel: String = ""
+        var rateLabel: String = ""
     }
+
+    /// One 250 ms window of device-buffer depth, for the trace.
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var status = Status()
     @Published private(set) var log: [String] = []
     @Published private(set) var summary: String = ""
+    @Published private(set) var nowPlaying = NowPlaying()
     @Published private(set) var tracks: [Track] = []
     @Published private(set) var currentTrack: Int = 0
     @Published private(set) var trackTotal: Int = 0
@@ -129,6 +162,7 @@ final class Engine: ObservableObject {
     // MARK: - Playback
 
     func play(url: URL) {
+        if nowPlaying.isEmpty { loadMetadata(for: url) }
         guard !isRunning else { pendingURL = url; stop(); return }
         pendingURL = nil
 
@@ -204,6 +238,71 @@ final class Engine: ObservableObject {
         }
     }
 
+    /// Reads tags for the selected file. Falls back to the filename when
+    /// Spotlight has nothing, which is normal for files it has not indexed.
+    func loadMetadata(for url: URL) {
+        let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+        guard !isDir else { nowPlaying = NowPlaying(); return }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            var np = NowPlaying()
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/mdls")
+            p.arguments = ["-name", "kMDItemTitle", "-name", "kMDItemAuthors",
+                           "-name", "kMDItemAlbum", "-name", "kMDItemDurationSeconds",
+                           "-name", "kMDItemAudioBitRate", url.path]
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = FileHandle.nullDevice
+            do {
+                try p.run()
+            } catch {
+                Task { @MainActor in self.nowPlaying = NowPlaying() }
+                return
+            }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            let text = String(data: data, encoding: .utf8) ?? ""
+
+            // mdls prints multi-line plist arrays, so flatten to one line and
+            // split by key. Artists in particular arrives as ( "A", "B" ).
+            let flat = text.split(separator: "\n").joined(separator: " ")
+            func field(_ key: String) -> String? {
+                // Keys are space-padded up to "=" and values are quoted, e.g.
+                //   kMDItemTitle           = "The Night We Called It A Day"
+                // so locate the key, then the next "=" after it, not "key = ".
+                guard let kr = flat.range(of: key) else { return nil }
+                let afterKey = flat[kr.upperBound...]
+                guard let eq = afterKey.firstIndex(of: "=") else { return nil }
+                let rest = afterKey[afterKey.index(after: eq)...]
+                // Value ends where the next key begins.
+                let end = rest.range(of: "kMDItem")?.lowerBound ?? rest.endIndex
+                var v = String(rest[..<end])
+                v = v.replacingOccurrences(of: "(", with: "")
+                    .replacingOccurrences(of: ")", with: "")
+                    .replacingOccurrences(of: "\"", with: "")
+                    .trimmingCharacters(in: .whitespaces)
+                if v.isEmpty || v == "null" { return nil }
+                return v
+            }
+
+            np.title = field("kMDItemTitle") ?? ""
+            np.album = field("kMDItemAlbum") ?? ""
+            // Authors arrives as a plist array flattened to "A", "B".
+            if let authors = field("kMDItemAuthors") {
+                let cleaned = authors
+                    .split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty }
+                np.artist = cleaned.joined(separator: ", ")
+            }
+            if let d = field("kMDItemDurationSeconds"), let v = Double(d) { np.duration = v }
+            if let b = field("kMDItemAudioBitRate") { np.bitrate = Int(Double(b) ?? 0) }
+
+            Task { @MainActor in self.nowPlaying = np }
+        }
+    }
+
     /// Finder "Open With", drag onto the Dock icon, or `open -a PiBridge <file>`.
     func handleOpen(url: URL) { open(url: url) }
 
@@ -211,6 +310,7 @@ final class Engine: ObservableObject {
     /// the request is queued and started when the old process has really gone;
     /// otherwise the new file would be silently dropped.
     func open(url: URL) {
+        loadMetadata(for: url)
         guard isRunning else { play(url: url); return }
         pendingURL = url
         stop()
@@ -255,6 +355,8 @@ final class Engine: ObservableObject {
                 applyTrack(json: String(s.dropFirst("@track ".count)))
             } else if s.hasPrefix("@status ") {
                 apply(json: String(s.dropFirst("@status ".count)))
+            } else if s.hasPrefix("@fill ") {
+                applyFill(json: String(s.dropFirst("@fill ".count)))
             } else if s.hasPrefix("pibridge: ") {
                 let msg = String(s.dropFirst("pibridge: ".count))
                 note(msg)
@@ -330,15 +432,54 @@ final class Engine: ObservableObject {
         if phase == .connecting { phase = .playing }
     }
 
+    /// A window of real device-buffer depth from the receiver.
+    private func applyFill(json: String) {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return
+        }
+        func d(_ k: String) -> Double { (obj[k] as? NSNumber)?.doubleValue ?? 0 }
+        var st = status
+        st.devMinMs = d("min_ms")
+        st.devMeanMs = d("mean_ms")
+        st.devMaxMs = d("max_ms")
+        st.devP05Ms = d("p05_ms")
+        st.devP50Ms = d("p50_ms")
+        st.devP95Ms = d("p95_ms")
+        st.ringMs = d("ring_ms")
+        st.devXruns = Int(d("dev_xruns"))
+        if d("buffer_ms") > 0 { st.bufferMs = d("buffer_ms") }
+        st.hasDeviceStats = true
+        status = st
+
+        if phase == .connecting { phase = .playing }
+    }
+
     private func note(_ msg: String) {
         // Keep the log short; the counters live in the meters.
-        if msg.lowercased().contains("underrun") || msg.lowercased().contains("error") ||
-            msg.contains("aplay said") || msg.contains("closed") {
+        let lower = msg.lowercased()
+        if lower.contains("underrun") || lower.contains("error") ||
+            msg.contains("aplay said") || msg.contains("closed") ||
+            lower.contains("already in use") || lower.contains("still held") ||
+            lower.contains("receiver stopped") {
             errorText = msg
         }
         log.append(msg)
         if log.count > 200 { log.removeFirst(log.count - 200) }
         if phase == .connecting, msg.contains("streaming") { phase = .playing }
+        if let arrow = msg.range(of: " -> ") {
+            // "… -> hw:CARD=R2R,DEV=0 S32_LE 384000 Hz, buffer 8 ms, target 4 ms"
+            let rest = msg[arrow.upperBound...]
+            let bits = rest.split(separator: " ")
+            if bits.count >= 3, bits[1].contains("_") || bits[1] == "DSD_U32_BE" {
+                var st = status
+                st.formatLabel = String(bits[1])
+                if let hz = Double(bits[2]) {
+                    st.rateLabel = String(format: "%.1f kHz", hz / 1000)
+                }
+                status = st
+            }
+        }
     }
 
     /// Live gain. Sends the value to the running engine; the engine ramps to it,

@@ -22,4 +22,5 @@ for s in 16 32 128 256 512; do
 done
 
 iconutil -c icns "$WORK/AppIcon.iconset" -o app/Resources/AppIcon.icns
-echo "wrote app/Resources/AppIcon.icns ($ACCENT)"
+cp "$WORK/AppIcon.iconset/icon_256x256.png" docs/icon.png
+echo "wrote app/Resources/AppIcon.icns and docs/icon.png ($ACCENT)"

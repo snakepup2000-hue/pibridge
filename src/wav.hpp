@@ -6,6 +6,10 @@
 
 #pragma once
 
+#include <unistd.h>
+
+#include <atomic>
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -17,6 +21,15 @@ namespace pib {
 class WavReader {
 public:
     ~WavReader() { if (f_) std::fclose(f_); }
+
+    // Growing mode: the file is still being written. A short read is not EOF,
+    // it is "not yet"; wait and retry until *writerDone says the producer has
+    // exited. This is what lets playback start ~0.2 s in instead of waiting for
+    // a whole FLAC to be transcoded to WAV (3.4 s for a 7-minute track).
+    void setGrowing(const std::atomic<bool>* writerDone) {
+        growing_ = true;
+        writerDone_ = writerDone;
+    }
 
     bool open(const std::string& path, std::string& err) {
         f_ = std::fopen(path.c_str(), "rb");
@@ -64,15 +77,23 @@ public:
 
     double rate() const { return static_cast<double>(rate_); }
     int channels() const { return ch_; }
+    long frameBytes() const { return frameBytes_; }
 
     // Reads one frame of interleaved input, duplicated to stereo.
     bool read(float& l, float& r) {
         unsigned char buf[16];
         const long want = frameBytes_;
-        if (dataBytes_ && dataRead_ >= static_cast<long>(dataBytes_)) return false;
-        if (std::fread(buf, 1, static_cast<std::size_t>(want), f_) != static_cast<std::size_t>(want)) {
+        // A growing file's declared data size is a placeholder while the writer
+        // is running, so it is ignored; EOF comes from the writer instead.
+        if (!growing_ && dataBytes_ && dataRead_ >= static_cast<long>(dataBytes_)) return false;
+        for (;;) {
+            const std::size_t got = std::fread(buf, 1, static_cast<std::size_t>(want), f_);
+            if (got == static_cast<std::size_t>(want)) break;
             if (std::ferror(f_)) return false;
-            return false;
+            if (!growing_) return false;
+            if (writerDone_ && *writerDone_) return false;  // real EOF
+            std::clearerr(f_);
+            ::usleep(2000);
         }
         dataRead_ += want;
         l = sample(buf);
@@ -126,6 +147,8 @@ private:
     std::FILE* f_ = nullptr;
     std::uint16_t fmt_ = 1, ch_ = 0, bits_ = 0;
     std::uint32_t rate_ = 0, dataBytes_ = 0;
+    bool growing_ = false;
+    const std::atomic<bool>* writerDone_ = nullptr;
     long dataStart_ = 0, dataRead_ = 0;
     int bytesPerSample_ = 0;
     long frameBytes_ = 0;

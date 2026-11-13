@@ -1,24 +1,83 @@
-# pibridge
+# PiBridge
 
 <img src="docs/icon.png" width="96" alt="PiBridge icon">
 
-> **Superseded by [PiBridge 2](https://github.com/snakepup2000-hue/pibridge2).** This
-> is the original: it works, it is installed as `PiBridge.app`, and it stays as the
-> fallback if PiBridge 2 misbehaves. Both can be installed at once
-> (`local.pibridge.app` / `local.pibridge2.app`); only one can hold the DAC at a time.
-> New work happens in PiBridge 2.
+Real-time PCM and **native DSD256** streaming from a Mac to a DAC on a Raspberry Pi,
+over the SSH path the Pi appliance already speaks. No daemon, no cross-compiler, no
+packages on the Pi: the Mac does the DSP and the Pi runs either stock `aplay` or the
+included `receiver/hqdac`, a static binary that drives `/dev/snd` directly.
 
-Real-time PCM and **native DSD256** streaming from this Mac to a DAC on a Raspberry Pi,
-over the SSH path the Pi appliance already speaks. Developed against a FiiO K11 R2R; see
-[Setting up your Pi](#setting-up-your-pi) to point it at yours.
+The GUI is built as an instrument rather than a dashboard — the signal path and the
+device-buffer trace are the interface, not decoration.
 
-No daemon, no cross-compiler, no packages on the Pi. The Mac does the DSP; the Pi runs
-either stock `aplay` or the included `receiver/hqdac`, a static binary that drives
-`/dev/snd` directly (see **[receiver/README.md](receiver/README.md)**).
+There used to be two of these, a simple one and this one. They shared an engine and a
+receiver and differed only in the front end, so they are now one project: this repo
+holds the instrument GUI, and the earlier four-panel interface is preserved at the
+`simple-gui` tag (`git worktree add ../simple simple-gui`).
 
-`receiver/hqdac.c` and the checked-in `hqdac-aarch64` are byte-identical to PiBridge 2's.
-The receiver is shared between the two: it is the same program on the Pi whichever GUI
-drives it, and it is rebuilt with `receiver/build-static.sh` (Docker, no cross-compiler).
+## What changed from the four-panel layout
+
+- **The signal path is the spine.** `ENCODE → SSH → RING → K11 · DMA` across the
+  top, each hop showing its real state and turning amber/red on its own. It
+  replaced four identical rounded boxes that said nothing about network audio.
+- **The buffer trace is the centrepiece.** A 60 s band of the min–max device
+  depth per 250 ms window, with the configured buffer and the floor as rails and
+  a cross at any window that ran out of margin. Drift and starvation show up as
+  shape instead of being inferred from a bar.
+- **One big number:** in-flight milliseconds (ring + device), everything else
+  9–11 pt monospaced.
+- **Stepped buffer, not a slider:** 4/6/8/12/20/50 ms. 2/3/4 ms all quantise to
+  4 ms in hardware, so a continuous control offered values that silently became
+  something else.
+- **Peak dropped, RMS kept small.** Peak was the other half of "generic audio
+  app".
+- **The graph does not lie.** Depth comes from the receiver's own windowed
+  `DELAY` stats over a new `@fill` JSON line, not from pibridge's 80 ms `/proc`
+  poll, which aliases against a small buffer.
+
+## Start latency
+
+Measured from a cold state (ssh control socket closed, no decoder cache):
+
+| step | time |
+|---|---|
+| WAV → sound | 0.17 s |
+| FLAC → sound (was 3.37 s) | **~0.66 s** |
+| app click → sound | **~0.70 s** |
+
+The FLAC delay was `afconvert` transcoding the whole file to WAV before a single
+sample played. It now runs in the background and playback starts on the first
+half-second of audio, reading the rest as it lands. The same file is also no
+longer decoded twice (the playlist probe and the playback loop both used to).
+
+### A held DAC used to fail silently
+
+The K11 has one playback subdevice. When a receiver from an earlier run was still
+holding it, the next stream opened, wrote ~700 frames and exited in 0.8 s — with
+`output closed (the Pi link dropped?)`, which points at the network when the real
+cause is a stranded process. Now:
+
+- pibridge notes the reason the receiver stopped (it was being discarded, because
+  the receiver's stderr was only scanned for `underrun`), and
+- it asks the device's state first, waits up to 6 s for a previous holder, then
+  fails with an actionable message and a non-zero exit so a GUI can show it:
+
+```
+pibridge: the DAC is already in use (state: RUNNING) — waiting up to 6 s for it to free
+pibridge: the DAC is still held by another player.
+pibridge: stop it (or wait for it), then play again. A stale receiver frees itself within 5 s.
+```
+
+## Which buffer to pick
+
+Measured on the K11 over ssh in 20 s runs (see `receiver/README.md`):
+
+| buffer | worst case seen | verdict |
+|---|---|---|
+| 4 ms | dips to 0.006 ms, 1–2× per 20 s | hardware floor, not safe over ssh |
+| 6 ms | 4.00 ms of 5.0 | safe |
+| 8 ms | 6.25 ms of 7.5 | safe, the default |
+| 20 ms | 19.00 ms of 20 | safe, comfortable |
 
 ```bash
 ./build.sh
@@ -28,7 +87,8 @@ drives it, and it is rebuilt with `receiver/build-static.sh` (Docker, no cross-c
 ./build/pibridge play track.flac --buffer-ms 15  # low latency
 ./build/pibridge play ~/Music/Album              # a whole folder, in order
 ./build/pibridge play ~/Music/Album --recursive   # folder and sub-folders
-./build/pibridge play track.flac --receiver='~/hqdac' --buffer-ms 4  # fixed, verifiable buffer
+./build/pibridge play track.flac --receiver='~/hqdac' --buffer-ms 8  # fixed, verifiable buffer
+./build_app.sh && ./install.sh                     # builds PiBridge 2.app
 ```
 
 The PiBridge app has a **Receiver** setting for the same thing (default `~/hqdac`, buffer
@@ -49,16 +109,20 @@ input is transcoded to float32 WAV with `afconvert` first, WAV goes straight in.
 runs as a child process, so a UI hang cannot disturb audio.
 
 ```bash
-./build_app.sh
+./build_app.sh                            # build it
 open build/PiBridge.app
-./tools/make_icon.sh          # regenerate the app icon (blue accent)
+./install.sh                              # or build and copy to /Applications
+./tools/make_icon.sh                      # regenerate the app icon
 open -a build/PiBridge.app track.flac     # or drag onto the window / use Open With
 ```
 
-The queue panel lists the folder in play order with the current track highlighted;
-⌘← and ⌘→ skip. It shows the DAC's buffer depth, peak and RMS of what is being sent, the drift trim, and a
-live underrun count; **Link test** runs the `diag` command and prints what the Pi and the
-K11 actually report. Buffer, gain, PCM/DSD and the network settings persist between runs.
+The window is laid out around the path audio actually takes: `ENCODE → SSH → RING →
+DAC · DMA` across the top, each hop showing its own state. Under it, a rolling band of
+the device-buffer depth, with the configured buffer and the minimum safe depth as rails.
+The queue lists the folder in play order with the current track highlighted; ⌘← and ⌘→
+skip. There is a PCM/DSD256 toggle and an in-flight-milliseconds readout; **Link test**
+runs the `diag` command and prints what the Pi and the DAC report. Buffer, gain, PCM/DSD
+and the network settings persist between runs.
 
 The app build needs Xcode's toolchain, not just CommandLineTools: the CLT SDK does not ship
 the `SwiftUIMacros` plugin, so `@State`/`@StateObject` cannot expand there.
@@ -178,6 +242,9 @@ macOS 13 or later / Apple silicon. A Raspberry Pi reachable over SSH with a DAC 
 Built and tested against a Raspberry Pi 4B running the Signalyst NAA image (no sudo,
 pubkey-only SSH) and a FiiO K11 R2R, which is what the latency and underrun numbers
 below were measured on.
+
+The app build needs Xcode's toolchain, not just CommandLineTools — the CLT SDK has no
+`SwiftUIMacros` plugin, so `@State` cannot expand there.
 
 ## Setting up your Pi
 

@@ -16,7 +16,11 @@ struct PiBridgeApp: App {
                 .frame(minWidth: 760, minHeight: 560)
                 .onAppear { WindowPlacer.placeIfOffscreen() }
         }
-        .windowResizability(.contentSize)
+        // contentMinSize, not contentSize: the instrument is worth making
+        // bigger, and a restored frame from an older layout must not be able
+        // to squeeze it below its minimum.
+        .windowResizability(.contentMinSize)
+        .defaultSize(width: 1060, height: 700)
         .commands {
             CommandGroup(replacing: .newItem) {}
         }
@@ -119,20 +123,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// MARK: - Palette
-
 private enum Ink {
     static let bg = Color(red: 0.055, green: 0.06, blue: 0.075)
     static let panel = Color(red: 0.095, green: 0.102, blue: 0.125)
     static let panelEdge = Color.white.opacity(0.07)
     static let text = Color(white: 0.92)
     static let dim = Color(white: 0.55)
+    static let faint = Color(white: 0.36)
     static let accent = Color(red: 0.42, green: 0.82, blue: 0.72)
     static let warm = Color(red: 0.95, green: 0.72, blue: 0.36)
     static let bad = Color(red: 0.93, green: 0.42, blue: 0.42)
+    static let rail = Color.white.opacity(0.13)
 }
 
-// MARK: - Root
+/// Health of one hop in the chain.
+enum HopState { case idle, good, warn, bad }
 
 struct ContentView: View {
     @EnvironmentObject var engine: Engine
@@ -143,26 +148,19 @@ struct ContentView: View {
     @State private var loadingDiag = false
     @State private var dropTargeted = false
     @State private var hovered: Int?
+    @State private var showingQueue = false
 
     var body: some View {
         VStack(spacing: 0) {
-            header
+            signalPath
             Divider().overlay(Ink.panelEdge)
-
-            HStack(alignment: .top, spacing: 14) {
-                VStack(spacing: 14) {
-                    sourcePanel
-                    transportPanel
-                }
-                .frame(width: 392)
-
-                VStack(spacing: 14) {
-                    metersPanel
-                    queuePanel
-                }
+            HStack(spacing: 0) {
+                depthPanel
+                Divider().overlay(Ink.panelEdge)
+                sidePanel
             }
-            .padding(14)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            Divider().overlay(Ink.panelEdge)
+            transport
         }
         .background(Ink.bg)
         .foregroundStyle(Ink.text)
@@ -170,7 +168,6 @@ struct ContentView: View {
         .sheet(isPresented: $showingDiag) { diagSheet }
         .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
             guard let provider = providers.first else { return false }
-            // Directories land here too; the engine expands them in order.
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
                 guard let url else { return }
                 Task { @MainActor in
@@ -183,18 +180,87 @@ struct ContentView: View {
         .overlay(dropHighlight)
     }
 
-    // MARK: Header
+    // MARK: Signal path
 
-    private var header: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("PiBridge").font(.system(size: 17, weight: .semibold, design: .rounded))
-                Text("Mac → \(engine.host) → \(engine.device)")
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(Ink.dim)
+    /// The spine of the app: the actual chain, left to right, with the state
+    /// each hop is really in. This replaces four unrelated dashboard panels.
+    private var signalPath: some View {
+        HStack(spacing: 0) {
+            titleBlock
+            Spacer(minLength: 12)
+            HopNode(label: "ENCODE",
+                    value: engine.status.formatLabel.isEmpty ? "—" : engine.status.formatLabel,
+                    sub: engine.status.rateLabel,
+                    state: engine.isRunning ? .good : .idle)
+            HopLink(active: engine.isRunning)
+            HopNode(label: "SSH",
+                    value: engine.isRunning ? "linked" : "idle",
+                    sub: engine.user.isEmpty ? "" : "\(engine.user)@\(engine.host)",
+                    state: engine.isRunning ? .good : .idle)
+            HopLink(active: engine.isRunning)
+            HopNode(label: "RING",
+                    value: engine.status.ringMs > 0
+                        ? String(format: "%.1f ms", engine.status.ringMs) : "—",
+                    sub: "jitter budget",
+                    state: engine.status.ringMs > 0 ? .good : .idle)
+            HopLink(active: engine.isRunning)
+            HopNode(label: "DAC · DMA",
+                    value: engine.status.devMeanMs > 0
+                        ? String(format: "%.2f ms", engine.status.devMeanMs) : "—",
+                    sub: engine.status.bufferMs > 0
+                        ? String(format: "of %.0f ms buffer", engine.status.bufferMs) : "no lock",
+                    state: dacState)
+            Spacer(minLength: 8)
+            headerButtons
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(Ink.panel)
+    }
+
+    private var dacState: HopState {
+        guard engine.isRunning else { return .idle }
+        let bad = engine.status.xruns + engine.status.underruns + engine.status.devXruns
+        if bad > 0 { return .bad }
+        // Margin is what matters: a fill that ever touches the floor is one
+        // scheduling hiccup from an audible click.
+        if engine.status.devMinMs > 0, engine.status.devMinMs <= 1.0 { return .warn }
+        return .good
+    }
+
+    private var titleBlock: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                Text("PiBridge")
+                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                phaseBadge
             }
-            Spacer()
-            phaseBadge
+            Text(engine.receiver == "aplay" ? "via aplay" : "via hqdac · fixed buffer")
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(Ink.faint)
+        }
+    }
+
+    private var phaseBadge: some View {
+        let (label, color): (String, Color) = {
+            switch engine.phase {
+            case .idle: return ("IDLE", Ink.faint)
+            case .connecting: return ("LINKING", Ink.warm)
+            case .playing: return ("PLAYING", Ink.accent)
+            case .stopping: return ("STOPPING", Ink.warm)
+            case .failed: return ("ERROR", Ink.bad)
+            }
+        }()
+        return Text(label)
+            .font(.system(size: 8, weight: .bold, design: .monospaced))
+            .tracking(0.8)
+            .foregroundStyle(color)
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(Capsule().fill(color.opacity(0.14)))
+    }
+
+    private var headerButtons: some View {
+        HStack(spacing: 10) {
             Button {
                 loadingDiag = true
                 showingDiag = true
@@ -203,194 +269,230 @@ struct ContentView: View {
                     diagText = t
                     loadingDiag = false
                 }
-            } label: {
-                Label("Link test", systemImage: "wave.3.right")
-            }
-            .buttonStyle(.borderless)
+            } label: { Image(systemName: "wave.3.right") }
+                .buttonStyle(.borderless)
+                .help("Link test: ask the Pi and the DAC what they are")
+
             Button { WindowPlacer.recenterOnMain() } label: {
                 Image(systemName: "macwindow.on.rectangle")
             }
             .buttonStyle(.borderless)
             .help("Move this window to the main display")
+
             Button { showingSettings = true } label: {
-                Label("Settings", systemImage: "slider.horizontal.3")
+                Image(systemName: "slider.horizontal.3")
             }
             .buttonStyle(.borderless)
+            .help("Settings")
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 11)
-        .background(Ink.panel)
+        .foregroundStyle(Ink.dim)
     }
 
-    private var phaseBadge: some View {
-        let (label, color): (String, Color) = {
-            switch engine.phase {
-            case .idle: return ("IDLE", Ink.dim)
-            case .connecting: return ("CONNECTING", Ink.warm)
-            case .playing: return ("PLAYING", Ink.accent)
-            case .stopping: return ("STOPPING", Ink.warm)
-            case .failed: return ("ERROR", Ink.bad)
+    // MARK: Depth — the instrument
+
+    private var depthPanel: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text(engine.status.inFlightMs > 0
+                     ? String(format: "%.2f", engine.status.inFlightMs) : "—")
+                    .font(.system(size: 46, weight: .medium, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(engine.isRunning ? Ink.text : Ink.faint)
+                Text("ms in flight")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(Ink.dim)
+                Spacer()
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(String(format: "ring %.1f", engine.status.ringMs))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(Ink.faint)
+                    Text(String(format: "dac %.2f–%.2f",
+                                engine.status.devP05Ms, engine.status.devP95Ms))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(Ink.faint)
+                }
             }
-        }()
-        return HStack(spacing: 6) {
-            Circle().fill(color).frame(width: 7, height: 7)
-            Text(label).font(.system(size: 10, weight: .bold, design: .monospaced))
-                .foregroundStyle(color)
+
+            // v1's gauge: a fixed reference bar, no moving history to watch.
+            // Fed by the receiver's median fill, so it does not wander.
+            FillGauge(fillMs: engine.status.devP50Ms > 0
+                          ? engine.status.devP50Ms : engine.status.fillMs,
+                      bufferMs: engine.status.bufferMs)
+
+            bufferChoice
         }
-        .padding(.horizontal, 9).padding(.vertical, 4)
-        .background(Capsule().fill(color.opacity(0.12)))
+        .padding(16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    // MARK: Source
-
-    private var sourcePanel: some View {
-        Panel(title: "SOURCE") {
-            VStack(alignment: .leading, spacing: 9) {
-                HStack(spacing: 8) {
-                    Image(systemName: file == nil ? "music.note" : "music.note.list")
-                        .foregroundStyle(Ink.accent)
-                    Text(file?.lastPathComponent ?? "Drop a track or a folder")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(file == nil ? Ink.dim : Ink.text)
-                        .lineLimit(1).truncationMode(.middle)
-                    Spacer()
+    /// Stepped, not continuous: 2/3/4 ms all clamp to 4 ms in hardware, so a
+    /// free slider would offer settings that silently become something else.
+    private var bufferChoice: some View {
+        HStack(spacing: 6) {
+            Text("BUFFER")
+                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .tracking(1.0)
+                .foregroundStyle(Ink.faint)
+            ForEach([4.0, 6.0, 8.0, 12.0, 20.0, 50.0], id: \.self) { ms in
+                let selected = abs(engine.bufferMs - ms) < 0.5
+                Button { engine.bufferMs = ms } label: {
+                    Text("\(Int(ms))")
+                        .font(.system(size: 10, weight: selected ? .bold : .regular,
+                                      design: .monospaced))
+                        .foregroundStyle(selected ? Ink.bg : Ink.dim)
+                        .frame(width: 30, height: 20)
+                        .background(RoundedRectangle(cornerRadius: 4)
+                            .fill(selected ? Ink.accent : Color.white.opacity(0.05)))
                 }
-                .padding(10)
-                .frame(maxWidth: .infinity)
-                .background(RoundedRectangle(cornerRadius: 7).fill(Color.black.opacity(0.25)))
-                .overlay(RoundedRectangle(cornerRadius: 7)
-                    .strokeBorder(dropTargeted ? Ink.accent : Ink.panelEdge, lineWidth: 1))
-
-                HStack(spacing: 8) {
-                    Button {
-                        chooseTrack()
-                    } label: {
-                        Label("Open File", systemImage: "music.note")
-                            .font(.system(size: 12, weight: .medium))
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 4)
-                    }
-                    .controlSize(.large)
-
-                    Button {
-                        chooseFolder()
-                    } label: {
-                        Label("Open Folder", systemImage: "folder.fill")
-                            .font(.system(size: 12, weight: .medium))
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 4)
-                    }
-                    .controlSize(.large)
-                    .buttonStyle(.borderedProminent)
-                    .tint(Ink.accent)
-                    .keyboardShortcut("o", modifiers: [.command])
-                }
-
-                HStack(spacing: 8) {
-                    Button(engine.dsd ? "Switch to PCM" : "Switch to DSD") {
-                        engine.dsd.toggle()
-                    }
-                    .help("Switch between PCM and native DSD256")
-                    Spacer()
-                    Text(engine.dsd ? "DSD256" : "352.8 kHz")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(Ink.dim)
-                }
-
-                Divider().overlay(Ink.panelEdge)
-
-                LabeledSlider(label: "Buffer", value: $engine.bufferMs,
-                              range: 4...200, format: "%.0f ms")
-                LabeledSlider(label: "Gain",
-                              value: Binding(get: { engine.gainDb },
-                                             set: { engine.setGain($0) }),
-                              range: -24...6, format: "%+.1f dB")
-                Text(engine.isRunning
-                     ? "live · applies as you move it"
-                     : "applies when playback starts")
+                .buttonStyle(.plain)
+                .help(ms <= 5
+                      ? "\(Int(ms)) ms — the K11's floor, but below the safe margin over ssh"
+                      : "\(Int(ms)) ms device buffer")
+            }
+            Spacer()
+            if engine.isRunning {
+                Text("takes effect on next play")
                     .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(Ink.faint)
+            }
+        }
+    }
+
+    // MARK: Side
+
+    @ViewBuilder
+    private var sidePanel: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            nowPlaying
+            Divider().overlay(Ink.panelEdge)
+            if engine.tracks.isEmpty { logList } else { queueList }
+        }
+        .frame(width: 330)
+    }
+
+    private var nowPlaying: some View {
+        let np = engine.nowPlaying
+        let hasTags = !np.isEmpty
+
+        return VStack(alignment: .leading, spacing: 7) {
+            // Real tags when Spotlight has them, filename when it does not.
+            Text(hasTags ? np.title
+                         : (file?.lastPathComponent ?? "No track loaded"))
+                .font(.system(size: 13, weight: .semibold))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .foregroundStyle(file == nil ? Ink.dim : Ink.text)
+
+            if hasTags {
+                Text(np.artist.isEmpty ? np.album
+                                       : (np.album.isEmpty ? np.artist
+                                                           : "\(np.artist) — \(np.album)"))
+                    .font(.system(size: 11))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                     .foregroundStyle(Ink.dim)
             }
+
+            if np.duration > 0 {
+                // Elapsed / total, with a thin progress rail. Not scrubbable:
+                // the engine has no seek yet, and a bar that looks draggable but
+                // is not would be the worst of both.
+                HStack(spacing: 7) {
+                    Text(clock(engine.status.seconds))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(Ink.faint)
+                        .frame(width: 34, alignment: .leading)
+                    GeometryReader { geo in
+                        let t = min(1, max(0, engine.status.seconds / np.duration))
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(Ink.rail).frame(height: 3)
+                            Capsule().fill(Ink.accent.opacity(0.8))
+                                .frame(width: geo.size.width * t, height: 3)
+                        }
+                        .frame(maxHeight: .infinity, alignment: .center)
+                    }
+                    .frame(height: 10)
+                    Text(clock(np.duration))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(Ink.faint)
+                        .frame(width: 34, alignment: .trailing)
+                }
+            }
+
+            HStack(spacing: 8) {
+                Button { chooseTrack() } label: { Text("Open File") }
+                Button { chooseFolder() } label: { Text("Open Folder") }
+                    .keyboardShortcut("o", modifiers: [.command])
+                Spacer()
+            }
+            .controlSize(.small)
+            .font(.system(size: 11))
+
+            HStack(spacing: 8) {
+                Button(engine.dsd ? "DSD256" : "PCM") { engine.dsd.toggle() }
+                    .controlSize(.small)
+                    .help("Switch between PCM and native DSD256 (applies on next play)")
+                Spacer()
+                if engine.nowPlaying.bitrate > 0 {
+                    Text(String(format: "%.1f Mb/s", Double(np.bitrate) / 1_000_000))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(Ink.faint)
+                }
+            }
         }
+        .padding(14)
     }
 
-    // MARK: Transport
+    private var queueList: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("QUEUE · \(engine.currentTrack) OF \(max(engine.trackTotal, engine.tracks.count))")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .tracking(1.0)
+                    .foregroundStyle(Ink.faint)
+                Spacer()
+            }
+            .padding(.horizontal, 14).padding(.vertical, 9)
 
-    private var transportPanel: some View {
-        Panel(title: "TRANSPORT") {
-            VStack(spacing: 10) {
-                // One control per action, in transport order: ◀◀  ▶ / ■  ▶▶.
-                // There used to be a second stop icon, which made neither button
-                // read as "the" stop.
-                HStack(spacing: 8) {
-                    Button { engine.previous() } label: {
-                        Image(systemName: "backward.fill")
-                            .frame(width: 30, height: 30)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 1) {
+                    ForEach(engine.tracks) { t in
+                        let active = t.id == engine.currentTrack
+                        QueueRow(track: t, active: active, hovered: hovered == t.id)
+                            .contentShape(Rectangle())
+                            .onHover { inside in
+                                hovered = inside ? t.id : (hovered == t.id ? nil : hovered)
+                            }
+                            .onTapGesture { engine.play(track: t.id) }
                     }
-                    .buttonStyle(.bordered)
-                    .disabled(!engine.isRunning)
-                    .keyboardShortcut(.leftArrow, modifiers: [.command])
-                    .help("Previous track (⌘←)")
-
-                    Button {
-                        guard let f = file else { chooseTrack(); return }
-                        if engine.isRunning { engine.stop() } else { engine.open(url: f) }
-                    } label: {
-                        Label(engine.isRunning ? "Stop" : "Play",
-                              systemImage: engine.isRunning ? "stop.fill" : "play.fill")
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 7)
-                            .font(.system(size: 13, weight: .semibold))
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(engine.isRunning ? Ink.bad : Ink.accent)
-                    .keyboardShortcut(.space, modifiers: [])
-                    .help(engine.isRunning ? "Stop (space)" : "Play (space)")
-
-                    Button { engine.next() } label: {
-                        Image(systemName: "forward.fill")
-                            .frame(width: 30, height: 30)
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!engine.isRunning)
-                    .keyboardShortcut(.rightArrow, modifiers: [.command])
-                    .help("Next track (⌘→)")
                 }
-
-                if let err = engine.errorText {
-                    Text(err).font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(Ink.bad).lineLimit(3)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } else if !engine.summary.isEmpty {
-                    Text(engine.summary).font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(Ink.dim).lineLimit(2)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+                .padding(.horizontal, 8)
             }
         }
     }
 
-    // MARK: Meters
-
-    private var metersPanel: some View {
-        Panel(title: "LINK") {
-            VStack(spacing: 12) {
-                LevelBar(label: "PEAK", db: engine.status.peakDb)
-                LevelBar(label: "RMS", db: engine.status.rmsDb)
-
-                Divider().overlay(Ink.panelEdge)
-
-                FillGauge(fillMs: engine.status.fillMs, bufferMs: engine.status.bufferMs)
-
-                HStack(spacing: 0) {
-                    // aplay reports every xrun the moment it happens; this is
-                    // the number that matches what you hear.
-                    Readout(label: "XRUNS",
-                            value: "\(engine.status.xruns + engine.status.underruns)",
-                            warn: (engine.status.xruns + engine.status.underruns) > 0)
-                    Readout(label: "DRIFT", value: String(format: "%+.0f ppm", engine.status.trimPpm))
-                    Readout(label: "ELAPSED", value: clock(engine.status.seconds))
+    private var logList: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("ENGINE")
+                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .tracking(1.0)
+                .foregroundStyle(Ink.faint)
+                .padding(.horizontal, 14).padding(.vertical, 9)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 2) {
+                    if engine.log.isEmpty {
+                        Text("No activity yet.")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(Ink.faint)
+                    }
+                    ForEach(Array(engine.log.enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(line.contains("underrun") ? Ink.bad : Ink.dim)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
+                .padding(.horizontal, 14)
             }
         }
     }
@@ -400,57 +502,87 @@ struct ContentView: View {
         return String(format: "%d:%02d", t / 60, t % 60)
     }
 
-    // MARK: Queue
+    // MARK: Transport
 
-    @ViewBuilder
-    private var queuePanel: some View {
-        if engine.tracks.isEmpty {
-            logPanel
-        } else {
-            Panel(title: "QUEUE · \(engine.currentTrack) OF \(max(engine.trackTotal, engine.tracks.count))") {
-                ScrollView {
-                    // LazyVStack: a 1,044-track folder must not lay out every
-                    // row up front.
-                    LazyVStack(alignment: .leading, spacing: 1) {
-                        ForEach(engine.tracks) { t in
-                            let active = t.id == engine.currentTrack
-                            QueueRow(track: t, active: active, hovered: hovered == t.id)
-                                .contentShape(Rectangle())
-                                .onHover { inside in
-                                    hovered = inside ? t.id : (hovered == t.id ? nil : hovered)
-                                }
-                                .onTapGesture { engine.play(track: t.id) }
-                        }
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    private var transport: some View {
+        HStack(spacing: 12) {
+            Button { engine.previous() } label: {
+                Image(systemName: "backward.fill").frame(width: 34, height: 26)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Ink.dim)
+            .disabled(!engine.isRunning)
+            .keyboardShortcut(.leftArrow, modifiers: [.command])
+            .help("Previous track (⌘←)")
+
+            Button {
+                guard let f = file else { chooseTrack(); return }
+                if engine.isRunning { engine.stop() } else { engine.open(url: f) }
+            } label: {
+                Label(engine.isRunning ? "Stop" : "Play",
+                      systemImage: engine.isRunning ? "stop.fill" : "play.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 110, height: 26)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(engine.isRunning ? Ink.bg : Ink.bg)
+            .background(RoundedRectangle(cornerRadius: 6)
+                .fill(engine.isRunning ? Ink.bad : Ink.accent))
+            .keyboardShortcut(.space, modifiers: [])
+            .help(engine.isRunning ? "Stop (space)" : "Play (space)")
+
+            Button { engine.next() } label: {
+                Image(systemName: "forward.fill").frame(width: 34, height: 26)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Ink.dim)
+            .disabled(!engine.isRunning)
+            .keyboardShortcut(.rightArrow, modifiers: [.command])
+            .help("Next track (⌘→)")
+
+            Spacer()
+
+            VolumeKnob(db: Binding(get: { engine.gainDb },
+                                   set: { engine.setGain($0) }))
+
+            Divider().frame(height: 26).overlay(Ink.panelEdge)
+
+            RmsMeter(db: engine.status.rmsDb)
+
+            counter(label: "XRUNS",
+                    value: "\(engine.status.xruns + engine.status.underruns + engine.status.devXruns)",
+                    bad: engine.status.xruns + engine.status.underruns + engine.status.devXruns > 0)
+
+            if let err = engine.errorText {
+                Text(err)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(Ink.bad)
+                    .lineLimit(1)
+                    .frame(maxWidth: 260, alignment: .trailing)
+            } else if !engine.summary.isEmpty {
+                Text(engine.summary)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(Ink.faint)
+                    .lineLimit(1)
+                    .frame(maxWidth: 260, alignment: .trailing)
             }
         }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(Ink.panel)
     }
 
-    // MARK: Log
-
-    private var logPanel: some View {
-        Panel(title: "ENGINE") {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 2) {
-                    if engine.log.isEmpty {
-                        Text("No activity yet.").foregroundStyle(Ink.dim)
-                            .font(.system(size: 10, design: .monospaced))
-                    }
-                    ForEach(Array(engine.log.enumerated()), id: \.offset) { _, line in
-                        Text(line)
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(line.contains("underrun") ? Ink.bad : Ink.dim)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    private func counter(label: String, value: String, bad: Bool) -> some View {
+        VStack(alignment: .trailing, spacing: 1) {
+            Text(label)
+                .font(.system(size: 8, weight: .bold, design: .monospaced))
+                .tracking(0.8)
+                .foregroundStyle(Ink.faint)
+            Text(value)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(bad ? Ink.bad : Ink.dim)
         }
     }
-
-    // MARK: Diag
 
     private var diagSheet: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -507,122 +639,58 @@ struct ContentView: View {
     private func chooseFile() { chooseFolder() }
 }
 
+
 // MARK: - Components
 
-/// One song in the folder. Clicking it jumps playback to that track.
-struct QueueRow: View {
-    let track: Engine.Track
-    let active: Bool
-    let hovered: Bool
+/// One hop in the signal chain.
+struct HopNode: View {
+    let label: String
+    let value: String
+    let sub: String
+    let state: HopState
+
+    private var color: Color {
+        switch state {
+        case .idle: return Ink.faint
+        case .good: return Ink.accent
+        case .warn: return Ink.warm
+        case .bad: return Ink.bad
+        }
+    }
 
     var body: some View {
         HStack(spacing: 7) {
-            Group {
-                if active {
-                    Image(systemName: "speaker.wave.2.fill")
-                        .font(.system(size: 8))
-                } else if hovered {
-                    Image(systemName: "play.fill")
-                        .font(.system(size: 8))
-                } else {
-                    Text(String(format: "%02d", track.id))
-                        .font(.system(size: 9, design: .monospaced))
-                }
+            Circle().fill(color).frame(width: 5, height: 5)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label)
+                    .font(.system(size: 8, weight: .bold, design: .monospaced))
+                    .tracking(0.8)
+                    .foregroundStyle(Ink.faint)
+                Text(value)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .monospacedDigit()
+                    .foregroundStyle(state == .idle ? Ink.faint : Ink.text)
+                Text(sub)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(Ink.faint)
+                    .lineLimit(1)
             }
-            .foregroundStyle(active ? Ink.accent : (hovered ? Ink.text : Ink.dim))
-            .frame(width: 18, alignment: .trailing)
-
-            Text(track.name)
-                .font(.system(size: 11, weight: active ? .semibold : .regular))
-                .foregroundStyle(active ? Ink.text : (hovered ? Ink.text : Ink.dim))
-                .lineLimit(1)
-                .truncationMode(.middle)
-
-            Spacer(minLength: 4)
         }
-        .padding(.vertical, 3)
-        .padding(.horizontal, 5)
-        .background(RoundedRectangle(cornerRadius: 4)
-            .fill(active ? Ink.accent.opacity(0.12)
-                         : (hovered ? Color.white.opacity(0.06) : Color.clear)))
-        .help(active ? "Playing" : "Play this track")
     }
 }
 
-struct Panel<Content: View>: View {
-    let title: String
-    @ViewBuilder var content: Content
-
+/// A short line between hops, lit while audio is flowing.
+struct HopLink: View {
+    let active: Bool
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Text(title)
-                .font(.system(size: 9, weight: .bold, design: .monospaced))
-                .foregroundStyle(Ink.dim)
-                .tracking(1.2)
-            content
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 9).fill(Ink.panel))
-        .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(Ink.panelEdge))
+        Rectangle()
+            .fill(active ? Ink.accent.opacity(0.45) : Ink.rail)
+            .frame(width: 22, height: 1)
+            .padding(.horizontal, 6)
     }
 }
 
-struct LabeledSlider: View {
-    let label: String
-    @Binding var value: Double
-    let range: ClosedRange<Double>
-    let format: String
-
-    var body: some View {
-        HStack(spacing: 9) {
-            Text(label)
-                .font(.system(size: 11)).foregroundStyle(Ink.dim)
-                .frame(width: 44, alignment: .leading)
-            Slider(value: $value, in: range)
-            Text(String(format: format, value))
-                .font(.system(size: 11, design: .monospaced))
-                .frame(width: 62, alignment: .trailing)
-        }
-    }
-}
-
-struct LevelBar: View {
-    let label: String
-    let db: Double
-
-    private var normalized: Double {
-        // -60 dB .. 0 dB
-        max(0, min(1, (db + 60) / 60))
-    }
-
-    private var color: Color {
-        if db > -1 { return Ink.bad }
-        if db > -9 { return Ink.warm }
-        return Ink.accent
-    }
-
-    var body: some View {
-        HStack(spacing: 9) {
-            Text(label)
-                .font(.system(size: 9, weight: .bold, design: .monospaced))
-                .foregroundStyle(Ink.dim).frame(width: 34, alignment: .leading)
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 2).fill(Color.black.opacity(0.4))
-                    RoundedRectangle(cornerRadius: 2).fill(color)
-                        .frame(width: geo.size.width * normalized)
-                }
-            }
-            .frame(height: 7)
-            Text(db <= -119 ? " −∞ " : String(format: "%5.1f", db))
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(Ink.dim).frame(width: 48, alignment: .trailing)
-        }
-    }
-}
-
-/// Shows the audio currently unplayed in the DAC's buffer — the honest latency.
+/// v1's DAC buffer gauge, kept verbatim: label, one bar, one number.
 struct FillGauge: View {
     let fillMs: Double
     let bufferMs: Double
@@ -649,7 +717,7 @@ struct FillGauge: View {
                     RoundedRectangle(cornerRadius: 3)
                         .fill(LinearGradient(colors: [Ink.accent, Ink.warm],
                                              startPoint: .leading, endPoint: .trailing))
-                        .frame(width: geo.size.width * fraction)
+                        .frame(width: geo.size.width * max(fraction, 0))
                 }
             }
             .frame(height: 10)
@@ -657,25 +725,164 @@ struct FillGauge: View {
     }
 }
 
-struct Readout: View {
-    let label: String
-    let value: String
-    var warn: Bool = false
+/// A real rotary volume control: turn by dragging, double-click to return to
+/// unity. Bound to the engine's live gain command, which ramps per block, so
+/// turning it during playback does not step or click.
+struct VolumeKnob: View {
+    @Binding var db: Double
+    var range: ClosedRange<Double> = -60.0...6.0
+
+    @State private var dragStartDb: Double? = nil
+
+    private var span: Double { range.upperBound - range.lowerBound }
+
+    /// 0 at the bottom-left of the sweep, 1 at the bottom-right.
+    private var fraction: Double {
+        max(0, min(1, (db - range.lowerBound) / span))
+    }
+
+    private var angle: Double { -135.0 + fraction * 270.0 }
+
+    private var label: String {
+        if db <= range.lowerBound { return "−∞" }
+        return String(format: "%+.1f", db)
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label)
-                .font(.system(size: 8, weight: .bold, design: .monospaced))
-                .foregroundStyle(Ink.dim).tracking(0.8)
-            Text(value)
-                .font(.system(size: 13, weight: .medium, design: .monospaced))
-                .foregroundStyle(warn ? Ink.bad : Ink.text)
+        HStack(spacing: 9) {
+            ZStack {
+                // Track
+                Circle()
+                    .trim(from: 0, to: 0.75)
+                    .stroke(Ink.rail, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                    .rotationEffect(.degrees(135))
+
+                // Filled arc
+                Circle()
+                    .trim(from: 0, to: 0.75 * fraction)
+                    .stroke(Ink.accent,
+                            style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                    .rotationEffect(.degrees(135))
+
+                // Body
+                Circle()
+                    .fill(LinearGradient(colors: [Color(white: 0.20), Color(white: 0.12)],
+                                         startPoint: .top, endPoint: .bottom))
+                    .padding(7)
+                    .overlay(Circle().strokeBorder(Ink.panelEdge).padding(7))
+
+                // Pointer
+                Rectangle()
+                    .fill(Ink.text)
+                    .frame(width: 2, height: 7)
+                    .offset(y: -8)
+                    .rotationEffect(.degrees(angle))
+            }
+            .frame(width: 40, height: 40)
+            .contentShape(Circle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { g in
+                        if dragStartDb == nil { dragStartDb = db }
+                        // Up increases; 0.6 dB per pixel over a 40 px throw.
+                        let delta = -g.translation.height * 0.6
+                        var v = (dragStartDb ?? db) + delta
+                        if (range.lowerBound...range.upperBound).contains(v) {
+                            // Gentle detent at unity, so 0 dB is easy to hit.
+                            if abs(v) < 0.6 { v = 0 }
+                            db = ((v * 10).rounded()) / 10
+                        } else {
+                            db = v < range.lowerBound ? range.lowerBound : range.upperBound
+                        }
+                    }
+                    .onEnded { _ in dragStartDb = nil }
+            )
+            .onTapGesture(count: 2) { db = 0 }
+            .help("Volume — drag up/down, double-click for 0 dB")
+            .accessibilityLabel("Volume")
+            .accessibilityValue("\(label) decibels")
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .monospacedDigit()
+                    .foregroundStyle(db <= range.lowerBound ? Ink.faint : Ink.text)
+                Text("dB")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(Ink.faint)
+            }
+            .frame(width: 44, alignment: .leading)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.trailing, 4)
     }
 }
 
-// MARK: - Settings
+/// RMS only. Peak next to it was the other half of "generic audio app"; the
+/// number that matters here is level, not transient headroom.
+struct RmsMeter: View {
+    let db: Double
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Text("RMS")
+                .font(.system(size: 8, weight: .bold, design: .monospaced))
+                .tracking(0.8)
+                .foregroundStyle(Ink.faint)
+            GeometryReader { geo in
+                let norm = max(0, min(1, (db + 60) / 60))
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 2).fill(Color.white.opacity(0.06))
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(db > -1 ? Ink.bad : (db > -9 ? Ink.warm : Ink.accent))
+                        .frame(width: geo.size.width * norm)
+                }
+            }
+            .frame(width: 70, height: 5)
+            Text(db <= -119 ? "−∞" : String(format: "%5.1f", db))
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(Ink.dim)
+                .frame(width: 38, alignment: .trailing)
+        }
+    }
+}
+
+/// One song in the folder. Clicking it jumps playback to that track.
+struct QueueRow: View {
+    let track: Engine.Track
+    let active: Bool
+    let hovered: Bool
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Group {
+                if active {
+                    Image(systemName: "speaker.wave.2.fill").font(.system(size: 8))
+                } else if hovered {
+                    Image(systemName: "play.fill").font(.system(size: 8))
+                } else {
+                    Text(String(format: "%02d", track.id))
+                        .font(.system(size: 9, design: .monospaced))
+                }
+            }
+            .foregroundStyle(active ? Ink.accent : (hovered ? Ink.text : Ink.faint))
+            .frame(width: 18, alignment: .trailing)
+
+            Text(track.name)
+                .font(.system(size: 11, weight: active ? .semibold : .regular))
+                .foregroundStyle(active ? Ink.text : (hovered ? Ink.text : Ink.dim))
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            Spacer(minLength: 4)
+        }
+        .padding(.vertical, 3)
+        .padding(.horizontal, 5)
+        .background(RoundedRectangle(cornerRadius: 4)
+            .fill(active ? Ink.accent.opacity(0.12)
+                         : (hovered ? Color.white.opacity(0.06) : Color.clear)))
+        .help(active ? "Playing" : "Play this track")
+    }
+}
 
 struct SettingsSheet: View {
     @EnvironmentObject var engine: Engine

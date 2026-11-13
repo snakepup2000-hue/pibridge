@@ -21,6 +21,9 @@
 #include <chrono>
 #include <filesystem>
 #include <algorithm>
+#include <map>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <mutex>
 #include <cmath>
 #include <cstdio>
@@ -89,21 +92,49 @@ struct Options {
 // ---------------------------------------------------------------------------
 // Telemetry from the Pi: one line per poll, "S <state> <delay-frames>".
 // ---------------------------------------------------------------------------
+// /tmp path for this engine's receiver telemetry.
+inline std::string statsPathForPid() {
+    return "/tmp/hqdac." + std::to_string(static_cast<long>(::getpid())) + ".stats";
+}
+
 struct Telemetry {
     std::atomic<long> delay{0};
     std::atomic<int> stateCode{0};  // 0 none, 1 running, 2 draining, 3 other
     std::atomic<bool> have{false};
     std::atomic<long> polls{0};
+    // The receiver's own windowed min/max/mean of the device delay. This is
+    // what the GUI graphs: our 80 ms poll of /proc aliases against a 4-8 ms
+    // buffer and reports phantom minimums, so it is not trustworthy on its own.
+    std::atomic<long> devMin{-1}, devMax{-1}, devMean{-1};   // frames
+    std::atomic<long> devP05{-1}, devP50{-1}, devP95{-1};    // frames
+    std::atomic<long> devRun{-1};                            // consecutive low polls
+    std::atomic<long> devXruns{-1};
+    std::atomic<long> devRate{0}, devBuffer{0}, devRing{0};
+    std::atomic<long> windows{0};
+    std::atomic<long> devSeq{0};   // receiver's own window counter
 };
 
 bool spawnTelemetry(const Options& o, Child& child, std::string& err) {
+    // Where hqdac publishes its windowed device-buffer stats. Named after this
+    // process: a leaked receiver from an earlier run otherwise keeps writing to
+    // a shared file and the new stream graphs the old one's numbers.
+    const std::string statsPath = statsPathForPid();
     // Single-quoted so nothing expands on this side; the remote shell runs it.
+    // This loop outlives its ssh client if pibridge is killed (SIGKILL leaves no
+    // chance to reap the channel), and three of them were found still spinning
+    // after earlier runs. It now exits by itself once the device has been
+    // closed for a couple of seconds, so an orphan cannot poll forever.
     const std::string script =
+        "gone=0; "
         "while :; do "
         "s=$(cat /proc/asound/card0/pcm0p/sub0/status 2>/dev/null); "
         "st=$(printf \"%s\\n\" \"$s\" | sed -n \"s/^state: *\\([A-Z]*\\).*/\\1/p\"); "
         "d=$(printf \"%s\\n\" \"$s\" | sed -n \"s/^delay *: *\\([0-9]*\\).*/\\1/p\"); "
         "echo \"S ${st:-none} ${d:-0}\"; "
+        "f=$(cat " + statsPath + " 2>/dev/null | tr \"\\n\" \" \"); "
+        "[ -n \"$f\" ] && echo \"F $f\"; "
+        "if [ \"${st:-none}\" = \"closed\" ]; then gone=$((gone+1)); else gone=0; fi; "
+        "[ $gone -gt 25 ] && break; "
         "sleep 0.08; done";
     const std::string remote = "sh -c '" + script + "'";
     return spawnRemote(o.sock, o.key, o.user, o.host, remote, false, true, false, child, err);
@@ -216,6 +247,31 @@ void telemetryThread(Child child, Telemetry* t) {
                 t->stateCode.store(stateCodeOf(state), std::memory_order_relaxed);
                 t->have.store(true, std::memory_order_relaxed);
                 t->polls.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            long wMin = 0, wMax = 0, wMean = 0, wXr = 0, wRate = 0, wBuf = 0, wRing = 0;
+            long long wFrames = 0;
+            long wSeq = 0, wP05 = 0, wP50 = 0, wP95 = 0, wRun = 0;
+            // "F min 1152 max 1536 mean 1534 xruns 0 rate 384000 buffer 1536
+            //  ring 4096 frames 576480"
+            if (std::sscanf(line.c_str(),
+                            "F min %ld max %ld mean %ld xruns %ld rate %ld buffer %ld ring %ld "
+                            "frames %lld seq %ld p05 %ld p50 %ld p95 %ld run %ld",
+                            &wMin, &wMax, &wMean, &wXr, &wRate, &wBuf, &wRing, &wFrames, &wSeq,
+                            &wP05, &wP50, &wP95, &wRun) == 13) {
+                t->devMin.store(wMin, std::memory_order_relaxed);
+                t->devMax.store(wMax, std::memory_order_relaxed);
+                t->devMean.store(wMean, std::memory_order_relaxed);
+                t->devXruns.store(wXr, std::memory_order_relaxed);
+                t->devRate.store(wRate, std::memory_order_relaxed);
+                t->devBuffer.store(wBuf, std::memory_order_relaxed);
+                t->devRing.store(wRing, std::memory_order_relaxed);
+                t->devP05.store(wP05, std::memory_order_relaxed);
+                t->devP50.store(wP50, std::memory_order_relaxed);
+                t->devP95.store(wP95, std::memory_order_relaxed);
+                t->devRun.store(wRun, std::memory_order_relaxed);
+                t->devSeq.store(wSeq, std::memory_order_relaxed);
+                t->windows.fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
@@ -353,23 +409,109 @@ void removeScratch() {
     scratchFiles().clear();
 }
 
-// Decodes anything CoreAudio understands into a float32 WAV via afconvert.
-bool materialise(const std::string& in, std::string& out, std::string& err) {
+// One background transcode per track, so playback can start on the first
+// seconds instead of waiting for the whole file.
+struct Transcode {
+    pid_t pid = -1;
+    std::string path;
+    std::atomic<bool> done{false};
+};
+std::vector<std::unique_ptr<Transcode>>& transcodes() {
+    static std::vector<std::unique_ptr<Transcode>> v;
+    return v;
+}
+// input path -> its transcode, so a file is decoded once per process.
+std::map<std::string, Transcode*>& transcodeCache() {
+    static std::map<std::string, Transcode*> m;
+    return m;
+}
+
+// Waits until the WAV has a parseable header and at least `seconds` of audio,
+// or the writer exits. Returns false only if nothing usable ever appeared.
+bool waitForAudio(const std::string& path, double rate, int ch, int bits, double seconds,
+                  const std::atomic<bool>& done, std::string& err) {
+    const long frameBytes = static_cast<long>(bits / 8) * ch;
+    const long headerGuess = 4096;   // generous: afconvert writes an extended fmt
+    const long need = headerGuess + static_cast<long>(rate * seconds) * frameBytes;
+    const double deadline = nowSeconds() + 15.0;
+    for (;;) {
+        struct stat st;
+        if (::stat(path.c_str(), &st) == 0 && static_cast<long>(st.st_size) >= need) return true;
+        if (done.load(std::memory_order_relaxed)) {
+            // Finished: as long as there is *some* audio beyond the header, go.
+            if (::stat(path.c_str(), &st) == 0 && st.st_size > headerGuess) return true;
+            err = "decoder produced no audio";
+            return false;
+        }
+        if (nowSeconds() > deadline) {
+            err = "timed out waiting for the decoder";
+            return false;
+        }
+        ::usleep(5000);
+    }
+}
+
+// Waits until enough of the file exists to read its WAV header.
+bool waitForHeader(const std::string& path, const std::atomic<bool>& done, std::string& err) {
+    const double deadline = nowSeconds() + 15.0;
+    for (;;) {
+        struct stat st;
+        if (::stat(path.c_str(), &st) == 0 && st.st_size >= 4096) return true;
+        if (done.load(std::memory_order_relaxed)) {
+            if (::stat(path.c_str(), &st) == 0 && st.st_size > 0) return true;
+            err = "decoder produced no output";
+            return false;
+        }
+        if (nowSeconds() > deadline) {
+            err = "timed out waiting for the decoder";
+            return false;
+        }
+        ::usleep(5000);
+    }
+}
+
+// Decodes anything CoreAudio understands into a float32 WAV, in the background.
+bool materialise(const std::string& in, std::string& out, std::string& err,
+                 const std::atomic<bool>** doneFlag) {
     if (isWav(in)) {
         out = in;
+        if (doneFlag) *doneFlag = nullptr;   // already complete
         return true;
     }
-    out = "/tmp/pibridge-decode-" + std::to_string(::getpid()) + ".wav";
-    if (std::find(scratchFiles().begin(), scratchFiles().end(), out) == scratchFiles().end()) {
-        scratchFiles().push_back(out);
+    auto cached = transcodeCache().find(in);
+    if (cached != transcodeCache().end()) {
+        out = cached->second->path;
+        if (doneFlag) *doneFlag = &cached->second->done;
+        return true;
     }
-    const std::string cmd =
-        "/usr/bin/afconvert -f WAVE -d LEF32 \"" + in + "\" \"" + out + "\" >/dev/null 2>&1";
-    const int rc = std::system(cmd.c_str());
-    if (rc != 0) {
-        err = "cannot decode " + in + " (afconvert failed)";
+    auto t = std::make_unique<Transcode>();
+    t->path = "/tmp/pibridge-decode-" + std::to_string(::getpid()) + "-" +
+              std::to_string(static_cast<long>(transcodes().size())) + ".wav";
+    out = t->path;
+    scratchFiles().push_back(out);
+
+    t->pid = ::fork();
+    if (t->pid == 0) {
+        ::execl("/usr/bin/afconvert", "afconvert", "-f", "WAVE", "-d", "LEF32",
+                in.c_str(), out.c_str(), (char*)nullptr);
+        ::_exit(127);
+    }
+    if (t->pid < 0) {
+        err = "cannot start afconvert";
         return false;
     }
+    Transcode* raw = t.get();
+    transcodes().push_back(std::move(t));
+    transcodeCache()[in] = raw;
+    if (doneFlag) *doneFlag = &raw->done;
+
+    // Reaper: marks the flag the reader polls for real EOF. Detached so the
+    // streaming loop never blocks on the decoder.
+    std::thread([raw]() {
+        int status = 0;
+        ::waitpid(raw->pid, &status, 0);
+        raw->done.store(true, std::memory_order_relaxed);
+    }).detach();
     return true;
 }
 
@@ -596,7 +738,9 @@ int main(int argc, char** argv) {
         for (std::size_t i = 0; i < tracks.size(); ++i) {
             std::string e;
             std::string candidate;
-            if (!materialise(tracks[i], candidate, e)) { ++skipped; continue; }
+            const std::atomic<bool>* probeDone = nullptr;
+            if (!materialise(tracks[i], candidate, e, &probeDone)) { ++skipped; continue; }
+            if (probeDone && !waitForHeader(candidate, *probeDone, e)) { ++skipped; continue; }
             WavReader peek;
             std::string e2;
             if (!peek.open(candidate, e2)) continue;
@@ -628,7 +772,7 @@ int main(int argc, char** argv) {
         const bool exact384 = std::fabs(k384 - std::round(k384)) < 1e-9;
         const bool exact352 = std::fabs(k352 - std::round(k352)) < 1e-9;
         if (exact384) {
-            o.outRate = 384000.0;  // K11 maximum, and an exact ratio (PCM or DSD256)
+            o.outRate = 384000.0;  // K11 maximum, and an exact ratio
         } else if (exact352) {
             o.outRate = 352800.0;  // K11's maximum for the 44.1 family
         } else {
@@ -686,6 +830,66 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        // The K11 has one playback subdevice, so a leftover receiver from an
+        // earlier run means this stream cannot open at all. Previously that
+        // surfaced as "output closed" after 0.8 s with no sound. Ask first, and
+        // give the previous holder a moment to let go.
+        {
+            const std::string q =
+                "sed -n \"s/^state: *\\([A-Z]*\\).*/\\1/p\" "
+                "/proc/asound/card0/pcm0p/sub0/status 2>/dev/null";
+            auto dacState = [&]() -> std::string {
+                Child c;
+                std::string e;
+                if (!spawnRemote(o.sock, o.key, o.user, o.host, q, false, true, false, c, e)) {
+                    return std::string();
+                }
+                std::string out;
+                char b[128];
+                for (;;) {
+                    const ssize_t n = ::read(c.out, b, sizeof b);
+                    if (n <= 0) break;
+                    out.append(b, static_cast<std::size_t>(n));
+                }
+                c.reap();
+                while (!out.empty() && (out.back() == '\n' || out.back() == ' ')) out.pop_back();
+                return out;
+            };
+
+            std::string state = dacState();
+            if (!state.empty() && state != "closed") {
+                std::fprintf(stderr,
+                             "pibridge: the DAC is already in use (state: %s) — waiting up to 6 s "
+                             "for it to free\n",
+                             state.c_str());
+                for (int i = 0; i < 12; ++i) {
+                    ::usleep(500000);
+                    state = dacState();
+                    if (state.empty() || state == "closed") break;
+                }
+                if (!state.empty() && state != "closed") {
+                    std::fprintf(stderr,
+                                 "pibridge: the DAC is still held by another player.\n"
+                                 "pibridge: stop it (or wait for it), then play again. A stale "
+                                 "receiver frees itself within 5 s of its sender going away.\n");
+                    return 1;
+                }
+                std::fprintf(stderr, "pibridge: the DAC is free, starting\n");
+            }
+        }
+
+        // Start from a clean telemetry file regardless of receiver: a stale one
+        // from an earlier hqdac run would otherwise be graphed as if it belonged
+        // to the stream now playing.
+        {
+            Child clr;
+            std::string clrErr;
+            if (spawnRemote(o.sock, o.key, o.user, o.host, "rm -f " + statsPathForPid(), false,
+                            false, false, clr, clrErr)) {
+                clr.reap();
+            }
+        }
+
         // A named receiver is checked before a stream is opened, so a missing
         // binary is one clear message instead of ssh exiting 127 mid-playback.
         // The path is left unquoted on purpose: ~ has to expand remotely.
@@ -738,10 +942,10 @@ int main(int argc, char** argv) {
             // jitter budget on top of it.
             std::snprintf(cmd, sizeof cmd,
                           "%s -D %s -t raw -f %s -r %ld -c 2 --buffer-time=%ld --period-time=%ld "
-                          "--target-time=%ld -",
+                          "--target-time=%ld --stats-file=%s -",
                           o.receiver.c_str(), o.device.c_str(), formatName(o).c_str(),
                           static_cast<long>(o.outRate), bufUs, perUs,
-                          static_cast<long>(targetMs * 1000.0));
+                          static_cast<long>(targetMs * 1000.0), statsPathForPid().c_str());
         }
         if (!spawnRemote(o.sock, o.key, o.user, o.host, cmd, true, false, true, data, err)) {
             std::fprintf(stderr, "pibridge: %s\n", err.c_str());
@@ -788,6 +992,7 @@ int main(int argc, char** argv) {
     std::vector<unsigned char> obuf;
     obuf.reserve(static_cast<std::size_t>(blockFrames * bytesPerFrame * 2));
 
+    long lastFillWindow = 0;
     double trim = 1.0;          // 1.0 == the DAC's nominal clock
     double integral = 0.0;
     double lastSteer = nowSeconds();
@@ -821,12 +1026,20 @@ int main(int argc, char** argv) {
         // Ramp across the block toward the requested gain.
         const double gTarget = gainTarget.load(std::memory_order_relaxed);
         const double gStep = (gTarget - gainNow) / static_cast<double>(n > 0 ? n : 1);
+        // Levels are measured AFTER the fader, so the meters show what is
+        // actually leaving for the DAC. Measured pre-gain the meters ignored the
+        // volume control entirely and the knob felt disconnected from the app.
+        // gainNow advances identically here and in the render loop below.
+        double gScan = gainNow;
         for (long i = 0; i < n; ++i) {
-            const double a = std::fabs(static_cast<double>(L[i]));
-            const double b = std::fabs(static_cast<double>(R[i]));
+            gScan += gStep;
+            const double la = std::max(-1.0, std::min(1.0, static_cast<double>(L[i]) * gScan));
+            const double ra = std::max(-1.0, std::min(1.0, static_cast<double>(R[i]) * gScan));
+            const double a = std::fabs(la);
+            const double b = std::fabs(ra);
             const double m = a > b ? a : b;
             if (m > peakLin) peakLin = m;
-            sumSq += static_cast<double>(L[i]) * L[i] + static_cast<double>(R[i]) * R[i];
+            sumSq += la * la + ra * ra;
         }
         levelFrames += 2LL * n;
         if (o.mode == "pcm") {
@@ -869,7 +1082,35 @@ int main(int argc, char** argv) {
         if (obuf.empty()) return;
         framesScheduled += static_cast<long long>(obuf.size() / bytesPerFrame);
         if (!writeAll(outFd, obuf.data(), obuf.size())) {
-            std::fprintf(stderr, "pibridge: output closed (the Pi link dropped?)\n");
+            // The receiver exits for one common, non-network reason: the DAC is
+            // already held by another player. It says so on stderr, but that
+            // stream is only scanned for "underrun", so the reason was being
+            // dropped and the user got "the Pi link dropped?" — which sent them
+            // looking at the network instead of at a stranded process.
+            std::string why;
+            {
+                std::lock_guard<std::mutex> lock(watch.mu);
+                std::string t = watch.text;
+                for (char& c : t) if (c == '\r') c = '\n';
+                std::size_t at = 0;
+                while (at < t.size()) {
+                    std::size_t nl = t.find('\n', at);
+                    if (nl == std::string::npos) nl = t.size();
+                    std::string line = t.substr(at, nl - at);
+                    if (line.find("busy") != std::string::npos ||
+                        line.find("failed") != std::string::npos ||
+                        line.find("cannot") != std::string::npos ||
+                        line.find("no input") != std::string::npos) {
+                        why = line;
+                    }
+                    at = nl + 1;
+                }
+            }
+            if (!why.empty()) {
+                std::fprintf(stderr, "pibridge: the receiver stopped: %s\n", why.c_str());
+            } else {
+                std::fprintf(stderr, "pibridge: output closed (the Pi link dropped?)\n");
+            }
             ended = true;
         }
         obuf.clear();
@@ -905,7 +1146,12 @@ int main(int argc, char** argv) {
                              !quitRequested.load(std::memory_order_relaxed); ++ti) {
         std::string tErr;
         std::string tw;
-        if (!materialise(tracks[ti], tw, tErr)) {
+        const std::atomic<bool>* decDone = nullptr;
+        if (!materialise(tracks[ti], tw, tErr, &decDone)) {
+            std::fprintf(stderr, "pibridge: skipping %s: %s\n", tracks[ti].c_str(), tErr.c_str());
+            continue;
+        }
+        if (decDone && !waitForHeader(tw, *decDone, tErr)) {
             std::fprintf(stderr, "pibridge: skipping %s: %s\n", tracks[ti].c_str(), tErr.c_str());
             continue;
         }
@@ -914,6 +1160,17 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "pibridge: skipping %s: %s\n", tracks[ti].c_str(), tErr.c_str());
             continue;
         }
+        // The decoder is usually still running. Read the file as it grows so
+        // playback starts on the first seconds rather than at end-of-transcode.
+        if (decDone && !waitForAudio(tw, rd.rate(), rd.channels(), rd.frameBytes(), 0.5, *decDone,
+                                     tErr)) {
+            // Even a partial file can play; only give up if nothing arrived.
+            if (!decDone->load(std::memory_order_relaxed) &&
+                std::remove(tw.c_str()) == 0) {
+                continue;
+            }
+        }
+        if (decDone) rd.setGrowing(decDone);
         const double trackRate = rd.rate();
         const std::string rateKey = std::to_string(static_cast<long>(trackRate));
         if (rateKey != asrcRateKey) {
@@ -994,6 +1251,41 @@ int main(int argc, char** argv) {
         }
         flushBlock(paced && o.localOut.empty());
 
+        // The receiver publishes a window every 250 ms; forward each one as it
+        // appears. Emitting from the 1 Hz status block instead would keep one
+        // window in four and frame the trace as if the buffer were quieter than
+        // it is.
+        if (o.statusJson) {
+            const long seenWindows = tm.devSeq.load(std::memory_order_relaxed);
+            if (seenWindows != lastFillWindow) {
+                const long dMin = tm.devMin.load(std::memory_order_relaxed);
+                const long dMax = tm.devMax.load(std::memory_order_relaxed);
+                const long dMean = tm.devMean.load(std::memory_order_relaxed);
+                const long dRate = tm.devRate.load(std::memory_order_relaxed);
+                const long dBuf = tm.devBuffer.load(std::memory_order_relaxed);
+                const long dRing = tm.devRing.load(std::memory_order_relaxed);
+                const long dXr = tm.devXruns.load(std::memory_order_relaxed);
+                if (dMin >= 0 && dRate > 0) {
+                    lastFillWindow = seenWindows;
+                    const double k = 1000.0 / static_cast<double>(dRate);
+                    std::fprintf(stderr,
+                                 "@fill {\"t\":%.2f,\"min_ms\":%.3f,\"mean_ms\":%.3f,"
+                                 "\"max_ms\":%.3f,\"ring_ms\":%.3f,\"buffer_ms\":%.3f,"
+                                 "\"p05_ms\":%.3f,\"p50_ms\":%.3f,\"p95_ms\":%.3f,"
+                                 "\"dip_run\":%ld,\"dev_xruns\":%ld,\"windows\":%ld}\n",
+                                 nowSeconds() - t0, static_cast<double>(dMin) * k,
+                                 static_cast<double>(dMean) * k,
+                                 static_cast<double>(dMax) * k,
+                                 static_cast<double>(dRing) * k,
+                                 static_cast<double>(dBuf) * k,
+                                 static_cast<double>(tm.devP05.load(std::memory_order_relaxed)) * k,
+                                 static_cast<double>(tm.devP50.load(std::memory_order_relaxed)) * k,
+                                 static_cast<double>(tm.devP95.load(std::memory_order_relaxed)) * k,
+                                 tm.devRun.load(std::memory_order_relaxed), dXr, seenWindows);
+                }
+            }
+        }
+
         // --- closed loop ------------------------------------------------
         // In clock mode the ASRC ratio is the only actuator, and the Pi's
         // reported buffer depth is the only honest observable: it counts the
@@ -1065,6 +1357,7 @@ int main(int argc, char** argv) {
                              nowSeconds() - t0, fillMs, bufferMs, (trim - 1.0) * 1e6,
                              st.underruns, framesOut, peakDb, rmsDb,
                              watch.xruns.load(std::memory_order_relaxed));
+
             } else {
                 std::fprintf(stderr, "  t=%5.1fs  fill=%6.1f/%.0f ms  trim=%+7.1f ppm\n",
                              nowSeconds() - t0, fillMs, bufferMs, (trim - 1.0) * 1e6);
@@ -1130,6 +1423,11 @@ int main(int argc, char** argv) {
     // miss everything shorter than a poll interval.
     st.underruns += watch.xruns.load(std::memory_order_relaxed);
 
+    // A stream that ended by itself having produced almost nothing is a
+    // failure, not a finished song. Exit non-zero so the app says so.
+    int exitCode = 0;
+    if (ended && framesOut < static_cast<long long>(o.outRate * 0.05)) exitCode = 3;
+
     removeScratch();
 
     // --- report ---------------------------------------------------------
@@ -1168,5 +1466,5 @@ int main(int argc, char** argv) {
             std::fclose(f);
         }
     }
-    return 0;
+    return exitCode;
 }
