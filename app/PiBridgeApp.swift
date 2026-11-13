@@ -189,7 +189,7 @@ struct ContentView: View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("PiBridge").font(.system(size: 17, weight: .semibold, design: .rounded))
-                Text("Mac → \(engine.host) → FiiO K11 R2R")
+                Text("Mac → \(engine.host) → \(engine.device)")
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(Ink.dim)
             }
@@ -688,7 +688,7 @@ struct SettingsSheet: View {
                 TextField("Host", text: $engine.host, prompt: Text(PiDefaults.host))
                 TextField("User", text: $engine.user, prompt: Text("up"))
                 TextField("ALSA device", text: $engine.device,
-                          prompt: Text("hw:CARD=R2R,DEV=0"))
+                          prompt: Text(PiDefaults.device))
                 TextField("SSH key", text: $engine.keyPath)
                 TextField("Receiver", text: $engine.receiver, prompt: Text("aplay"))
             }
